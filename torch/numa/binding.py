@@ -1,10 +1,11 @@
 import os
+import shutil
 import traceback
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from enum import Enum
+from functools import wraps
 from logging import getLogger
 from typing import Optional, TypeVar
 
@@ -14,7 +15,8 @@ from torch._utils_internal import signpost_event
 
 __all__ = [
     "AffinityMode",
-    "maybe_temporarily_apply_numa_binding_to_current_thread",
+    "maybe_apply_numa_binding_to_command_args",
+    "maybe_with_numa_binding",
     "NumaOptions",
 ]
 
@@ -39,7 +41,7 @@ class NumaOptions:
 
     """
     If true, we will fall back to using the original command/entrypoint if we fail to compute
-    or apply NUMA bindings.
+    NUMA bindings.
 
     You should avoid using this option! It is only intended as a safety mechanism for facilitating
     mass rollouts of numa binding.
@@ -47,35 +49,85 @@ class NumaOptions:
     should_fall_back_if_binding_fails: bool = False
 
 
-@contextmanager
-def maybe_temporarily_apply_numa_binding_to_current_thread(
+def _maybe_apply_numa_binding_to_current_thread(
     *, gpu_index: int, numa_options: Optional[NumaOptions]
-) -> Iterator[None]:
-    """
-    1. Applies NUMA binding to the current thread, suitable for the thread
-    which will be interacting with GPU gpu_index.
-    2. Resets to the original CPU affinity before exiting the context manager.
-    """
-    if numa_options is None:
-        yield
+) -> None:
+    logical_cpu_indices = _get_validated_logical_cpus_to_bind_to(
+        gpu_index=gpu_index,
+        numa_options=numa_options,
+        caller="apply_to_current_thread",
+    )
+    if logical_cpu_indices is None:
         return
 
-    original_logical_cpu_indices = _get_allowed_cpu_indices_for_current_thread()
-    _apply_numa_binding_to_current_thread(
-        gpu_index=gpu_index, numa_options=numa_options
-    )
-    yield
-    _bind_current_thread_to_logical_cpus(
-        logical_cpu_indices=original_logical_cpu_indices
+    _bind_current_thread_to_logical_cpus(logical_cpu_indices=logical_cpu_indices)
+    logger.info(
+        "Successfully bound to logical_cpu_indices=%s for NUMA binding",
+        _get_ranges_str_from_ints(logical_cpu_indices),
     )
 
 
-def _apply_numa_binding_to_current_thread(
-    *, gpu_index: int, numa_options: NumaOptions
-) -> None:
+def maybe_with_numa_binding(*, gpu_index: int, numa_options: Optional[NumaOptions]):
+    """
+    Decorator that applies NUMA binding before executing the decorated function.
+
+    Args:
+        gpu_index: The index of the GPU that will be used.
+        numa_options: See NumaOptions for details.
+
+    Usage:
+        @maybe_with_numa_binding(gpu_index=0, numa_options=NumaOptions(affinity_mode=AffinityMode.NODE))
+        def my_function():
+            # Your code here
+            pass
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            _maybe_apply_numa_binding_to_current_thread(
+                gpu_index=gpu_index,
+                numa_options=numa_options,
+            )
+            return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def maybe_apply_numa_binding_to_command_args(
+    command_args: tuple[str, ...],
+    *,
+    gpu_index: int,
+    numa_options: Optional[NumaOptions],
+) -> tuple[str, ...]:
+    logical_cpu_indices = _get_validated_logical_cpus_to_bind_to(
+        gpu_index=gpu_index, numa_options=numa_options, caller="apply_to_command_args"
+    )
+    if logical_cpu_indices is None:
+        return command_args
+
+    return (
+        "numactl",
+        f"--physcpubind={_get_ranges_str_from_ints(logical_cpu_indices)}",
+        *command_args,
+    )
+
+
+def _get_validated_logical_cpus_to_bind_to(
+    *,
+    gpu_index: int,
+    numa_options: Optional[NumaOptions],
+    caller: str,
+) -> Optional[set[int]]:
+    if numa_options is None:
+        return None
+
     kwargs = {
         "gpu_index": gpu_index,
         "numa_options": asdict(numa_options),
+        "caller": caller,
     }
     logger.info("Attempting to apply NUMA binding, given input %r", kwargs)
 
@@ -84,20 +136,17 @@ def _apply_numa_binding_to_current_thread(
             gpu_index=gpu_index, numa_options=numa_options
         )
         logger.info(
-            "Computed logical_cpu_indices=%s for NUMA binding",
+            "Computed logical_cpu_indices=%s for NUMA binding, given input %r",
             _get_ranges_str_from_ints(logical_cpu_indices),
+            kwargs,
         )
 
-        _raise_if_logical_cpu_indices_invalid(logical_cpu_indices=logical_cpu_indices)
-        logger.info(
-            "Validated logical_cpu_indices=%s for NUMA binding",
-            _get_ranges_str_from_ints(logical_cpu_indices),
-        )
+        _raise_if_binding_invalid(logical_cpu_indices=logical_cpu_indices)
 
-        _bind_current_thread_to_logical_cpus(logical_cpu_indices=logical_cpu_indices)
         logger.info(
-            "Successfully bound to logical_cpu_indices=%s for NUMA binding",
+            "Validated logical_cpu_indices=%s for NUMA binding, given input %r",
             _get_ranges_str_from_ints(logical_cpu_indices),
+            kwargs,
         )
 
         signpost_event(
@@ -108,6 +157,7 @@ def _apply_numa_binding_to_current_thread(
                 "logical_cpu_indices": _get_ranges_str_from_ints(logical_cpu_indices),
             },
         )
+        return logical_cpu_indices
     except Exception:
         signpost_event(
             category="numa_binding",
@@ -127,7 +177,12 @@ def _apply_numa_binding_to_current_thread(
         raise
 
 
-def _raise_if_logical_cpu_indices_invalid(*, logical_cpu_indices: set[int]) -> None:
+def _raise_if_binding_invalid(*, logical_cpu_indices: set[int]) -> None:
+    # NOTE: numactl CLI is only actually necessary for the str entrypoint path,
+    # but for simplicity we will just check it no matter what.
+    if shutil.which("numactl") is None:
+        raise RuntimeError("numactl CLI is required for NUMA binding")
+
     if not logical_cpu_indices:
         raise RuntimeError("Must bind to a non-empty set of CPU indices")
 
