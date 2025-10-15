@@ -486,8 +486,8 @@ test_inductor_aoti() {
 }
 
 test_inductor_aoti_cross_compile_for_windows() {
-  sudo apt-get update
-  sudo apt-get install -y g++-mingw-w64-x86-64-posix
+  # sudo apt-get update
+  # sudo apt-get install -y g++-mingw-w64-x86-64-posix
 
   TEST_REPORTS_DIR=$(pwd)/test/test-reports
   mkdir -p "$TEST_REPORTS_DIR"
